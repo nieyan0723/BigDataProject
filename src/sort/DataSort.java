@@ -1,41 +1,48 @@
 package sort;
 
+import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.net.URI;
-import java.util.ArrayList;
-import java.util.List;
 
-import common.DataOutputFormat;
-import common.DataInputFormat;
-
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.conf.Configurable;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.conf.Configured;
-import org.apache.hadoop.filecache.DistributedCache;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.io.NullWritable;
-import org.apache.hadoop.io.SequenceFile;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.JobContext;
+import org.apache.hadoop.mapreduce.MRJobConfig;
 import org.apache.hadoop.mapreduce.Partitioner;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import common.DataSortConfigKeys;
+import common.DataInputFormat;
+import common.DataOutputFormat;
 
 public class DataSort extends Configured implements Tool {
-    private static final Log LOG = LogFactory.getLog(DataSort.class);
+    private static final Logger LOG = LoggerFactory.getLogger(DataSort.class);
 
-    static class TotalOrderPartitioner extends Partitioner<Text, Text> {
+    /**
+     * A partitioner that splits text keys into roughly equal partitions in a global
+     * sorted order.
+     */
+    static class TotalOrderPartitioner extends Partitioner<Text, Text> implements Configurable {
         private TrieNode trie;
         private Text[] splitPoints;
+        private Configuration conf;
 
+        /**
+         * A generic trie node
+         */
         static abstract class TrieNode {
-            private final int level;
+            private int level;
 
-            TrieNode(final int level) {
+            TrieNode(int level) {
                 this.level = level;
             }
 
@@ -48,27 +55,30 @@ public class DataSort extends Configured implements Tool {
             }
         }
 
+        /**
+         * An inner trie node that contains 256 children based on the next character.
+         */
         static class InnerTrieNode extends TrieNode {
-            private final TrieNode[] child = new TrieNode[256];
+            private TrieNode[] child = new TrieNode[256];
 
-            InnerTrieNode(final int level) {
+            InnerTrieNode(int level) {
                 super(level);
             }
 
-            int findPartition(final Text key) {
-                final int level = getLevel();
+            int findPartition(Text key) {
+                int level = getLevel();
                 if (key.getLength() <= level) {
                     return child[0].findPartition(key);
                 }
-                return child[key.getBytes()[level]].findPartition(key);
+                return child[key.getBytes()[level] & 0xff].findPartition(key);
             }
 
-            void setChild(final int idx, final TrieNode child) {
+            void setChild(int idx, TrieNode child) {
                 this.child[idx] = child;
             }
 
-            void print(final PrintStream strm) throws IOException {
-                for (int ch = 0; ch < 255; ++ch) {
+            void print(PrintStream strm) throws IOException {
+                for (int ch = 0; ch < 256; ++ch) {
                     for (int i = 0; i < 2 * getLevel(); ++i) {
                         strm.print(' ');
                     }
@@ -81,28 +91,32 @@ public class DataSort extends Configured implements Tool {
             }
         }
 
+        /**
+         * A leaf trie node that does string compares to figure out where the given key
+         * belongs between lower..upper.
+         */
         static class LeafTrieNode extends TrieNode {
             int lower;
             int upper;
             Text[] splitPoints;
 
-            LeafTrieNode(final int level, final Text[] splitPoints, final int lower, final int upper) {
+            LeafTrieNode(int level, Text[] splitPoints, int lower, int upper) {
                 super(level);
                 this.splitPoints = splitPoints;
                 this.lower = lower;
                 this.upper = upper;
             }
 
-            int findPartition(final Text key) {
+            int findPartition(Text key) {
                 for (int i = lower; i < upper; ++i) {
-                    if (splitPoints[i].compareTo(key) >= 0) {
+                    if (splitPoints[i].compareTo(key) > 0) {
                         return i;
                     }
                 }
                 return upper;
             }
 
-            void print(final PrintStream strm) throws IOException {
+            void print(PrintStream strm) throws IOException {
                 for (int i = 0; i < 2 * getLevel(); ++i) {
                     strm.print(' ');
                 }
@@ -112,28 +126,45 @@ public class DataSort extends Configured implements Tool {
             }
         }
 
-        private static Text[] readPartitions(final FileSystem fs, final Path p, final Configuration conf)
-                throws IOException {
-            final SequenceFile.Reader reader = new SequenceFile.Reader(fs, p, conf);
-            final List<Text> parts = new ArrayList<Text>();
-            Text key = new Text();
-            final NullWritable value = NullWritable.get();
-            while (reader.next(key, value)) {
-                parts.add(key);
-                key = new Text();
+        /**
+         * Read the cut points from the given sequence file.
+         * 
+         * @param fs   the file system
+         * @param p    the path to read
+         * @param conf the job config
+         * @return the strings to split the partitions on
+         * @throws IOException
+         */
+        private static Text[] readPartitions(FileSystem fs, Path p, Configuration conf) throws IOException {
+            int reduces = conf.getInt(MRJobConfig.NUM_REDUCES, 1);
+            Text[] result = new Text[reduces - 1];
+            DataInputStream reader = fs.open(p);
+            for (int i = 0; i < reduces - 1; ++i) {
+                result[i] = new Text();
+                result[i].readFields(reader);
             }
             reader.close();
-            return parts.toArray(new Text[parts.size()]);
+            return result;
         }
 
-        private static TrieNode buildTrie(final Text[] splits, int lower, final int upper, final Text prefix,
-                final int maxDepth) {
-            final int depth = prefix.getLength();
+        /**
+         * Given a sorted set of cut points, build a trie that will find the correct
+         * partition quickly.
+         * 
+         * @param splits   the list of cut points
+         * @param lower    the lower bound of partitions 0..numPartitions-1
+         * @param upper    the upper bound of partitions 0..numPartitions-1
+         * @param prefix   the prefix that we have already checked against
+         * @param maxDepth the maximum depth we will build a trie for
+         * @return the trie node that will divide the splits correctly
+         */
+        private static TrieNode buildTrie(Text[] splits, int lower, int upper, Text prefix, int maxDepth) {
+            int depth = prefix.getLength();
             if (depth >= maxDepth || lower == upper) {
                 return new LeafTrieNode(depth, splits, lower, upper);
             }
-            final InnerTrieNode result = new InnerTrieNode(depth);
-            final Text trial = new Text(prefix);
+            InnerTrieNode result = new InnerTrieNode(depth);
+            Text trial = new Text(prefix);
             // append an extra byte on to the prefix
             trial.append(new byte[1], 0, 1);
             int currentBound = lower;
@@ -150,67 +181,143 @@ public class DataSort extends Configured implements Tool {
                 result.child[ch] = buildTrie(splits, lower, currentBound, trial, maxDepth);
             }
             // pick up the rest
-            trial.getBytes()[depth] = 127;
+            trial.getBytes()[depth] = (byte) 255;
             result.child[255] = buildTrie(splits, currentBound, upper, trial, maxDepth);
             return result;
         }
 
-        public void configure(final Configuration conf) {
+        public void setConf(Configuration conf) {
             try {
-                final FileSystem fs = FileSystem.getLocal(conf);
-                final Path partFile = new Path(DataInputFormat.PARTITION_FILENAME);
+                FileSystem fs = FileSystem.getLocal(conf);
+                this.conf = conf;
+                Path partFile = new Path(DataInputFormat.PARTITION_FILENAME);
                 splitPoints = readPartitions(fs, partFile, conf);
                 trie = buildTrie(splitPoints, 0, splitPoints.length, new Text(), 2);
-            } catch (final IOException ie) {
-                throw new IllegalArgumentException("can't read paritions file", ie);
+            } catch (IOException ie) {
+                throw new IllegalArgumentException("can't read partitions file", ie);
             }
         }
 
-        public TotalOrderPartitioner() {
-            configure(new Configuration());
+        public Configuration getConf() {
+            return conf;
         }
 
-        public int getPartition(final Text key, final Text value, final int numPartitions) {
+        public TotalOrderPartitioner() {
+        }
+
+        public int getPartition(Text key, Text value, int numPartitions) {
             return trie.findPartition(key);
         }
 
     }
 
-    public int run(final String[] args) throws Exception {
-        if (args == null || args.length < 2) {
-            System.err.println("Usage: bin/hadoop jar " + "big-data-project.jar datasort in-dir out-dir");
-            return -1;
+    /**
+     * A total order partitioner that assigns keys based on their first
+     * PREFIX_LENGTH bytes, assuming a flat distribution.
+     */
+    public static class SimplePartitioner extends Partitioner<Text, Text> implements Configurable {
+        int prefixesPerReduce;
+        private static final int PREFIX_LENGTH = 3;
+        private Configuration conf = null;
+
+        public void setConf(Configuration conf) {
+            this.conf = conf;
+            prefixesPerReduce = (int) Math
+                    .ceil((1 << (8 * PREFIX_LENGTH)) / (float) conf.getInt(MRJobConfig.NUM_REDUCES, 1));
         }
 
-        final Job job = new Job(getConf());
-        final Configuration conf = job.getConfiguration();
+        public Configuration getConf() {
+            return conf;
+        }
+
+        @Override
+        public int getPartition(Text key, Text value, int numPartitions) {
+            byte[] bytes = key.getBytes();
+            int len = Math.min(PREFIX_LENGTH, key.getLength());
+            int prefix = 0;
+            for (int i = 0; i < len; ++i) {
+                prefix = (prefix << 8) | (0xff & bytes[i]);
+            }
+            return prefix / prefixesPerReduce;
+        }
+    }
+
+    public static boolean getUseSimplePartitioner(JobContext job) {
+        return job.getConfiguration().getBoolean(DataSortConfigKeys.USE_SIMPLE_PARTITIONER.key(),
+                DataSortConfigKeys.DEFAULT_USE_SIMPLE_PARTITIONER);
+    }
+
+    public static void setUseSimplePartitioner(Job job, boolean value) {
+        job.getConfiguration().setBoolean(DataSortConfigKeys.USE_SIMPLE_PARTITIONER.key(), value);
+    }
+
+    public static int getOutputReplication(JobContext job) {
+        return job.getConfiguration().getInt(DataSortConfigKeys.OUTPUT_REPLICATION.key(),
+                DataSortConfigKeys.DEFAULT_OUTPUT_REPLICATION);
+    }
+
+    public static void setOutputReplication(Job job, int value) {
+        job.getConfiguration().setInt(DataSortConfigKeys.OUTPUT_REPLICATION.key(), value);
+    }
+
+    private static void usage() throws IOException {
+        System.err.println("Usage: datasort [-Dproperty=value] <in> <out>");
+        System.err.println("dataSort configurations are:");
+        for (DataSortConfigKeys dataSortConfigKeys : DataSortConfigKeys.values()) {
+            System.err.println(dataSortConfigKeys.toString());
+        }
+        System.err.println("If you want to store the output data as "
+                + "erasure code striping file, just make sure that the parent dir "
+                + "of <out> has erasure code policy set");
+    }
+
+    public int run(String[] args) throws Exception {
+        if (args.length != 2) {
+            usage();
+            return 2;
+        }
+        LOG.info("starting");
+        Job job = Job.getInstance(getConf());
         Path inputDir = new Path(args[0]);
-        inputDir = inputDir.makeQualified(inputDir.getFileSystem(conf));
-        final Path partitionFile = new Path(inputDir, DataInputFormat.PARTITION_FILENAME);
-        final URI partitionUri = new URI(partitionFile.toString() + "#" + DataInputFormat.PARTITION_FILENAME);
-        DataInputFormat.setInputPaths(job, new Path(args[0]));
-        FileOutputFormat.setOutputPath(job, new Path(args[1]));
+        Path outputDir = new Path(args[1]);
+        boolean useSimplePartitioner = getUseSimplePartitioner(job);
+        DataInputFormat.setInputPaths(job, inputDir);
+        FileOutputFormat.setOutputPath(job, outputDir);
         job.setJobName("DataSort");
         job.setJarByClass(DataSort.class);
         job.setOutputKeyClass(Text.class);
         job.setOutputValueClass(Text.class);
         job.setInputFormatClass(DataInputFormat.class);
         job.setOutputFormatClass(DataOutputFormat.class);
-        job.setPartitionerClass(TotalOrderPartitioner.class);
-        DataInputFormat.writePartitionFile(job, partitionFile);
-        DistributedCache.addCacheFile(partitionUri, conf);
-        DistributedCache.createSymlink(conf);
-        conf.setInt("dfs.replication", 1);
-        DataOutputFormat.setFinalSync(job, true);
+        if (useSimplePartitioner) {
+            job.setPartitionerClass(SimplePartitioner.class);
+        } else {
+            long start = System.currentTimeMillis();
+            Path partitionFile = new Path(outputDir, DataInputFormat.PARTITION_FILENAME);
+            URI partitionUri = new URI(partitionFile.toString() + "#" + DataInputFormat.PARTITION_FILENAME);
+            try {
+                DataInputFormat.writePartitionFile(job, partitionFile);
+            } catch (Throwable e) {
+                LOG.error("{}", e.getMessage(), e);
+                return -1;
+            }
+            job.addCacheFile(partitionUri);
+            long end = System.currentTimeMillis();
+            System.out.println("Spent " + (end - start) + "ms computing partitions.");
+            job.setPartitionerClass(TotalOrderPartitioner.class);
+        }
 
-        job.waitForCompletion(true);
-
+        job.getConfiguration().setInt("dfs.replication", getOutputReplication(job));
+        int ret = job.waitForCompletion(true) ? 0 : 1;
         LOG.info("done");
-        return 0;
+        return ret;
     }
 
-    public static void main(final String[] args) throws Exception {
-        final int res = ToolRunner.run(new Configuration(), new DataSort(), args);
+    /**
+     * @param args
+     */
+    public static void main(String[] args) throws Exception {
+        int res = ToolRunner.run(new Configuration(), new DataSort(), args);
         System.exit(res);
     }
 

@@ -1,31 +1,37 @@
 package common;
 
+import java.io.DataOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.io.NullWritable;
-import org.apache.hadoop.io.SequenceFile;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.mapreduce.InputSplit;
 import org.apache.hadoop.mapreduce.JobContext;
+import org.apache.hadoop.mapreduce.MRJobConfig;
 import org.apache.hadoop.mapreduce.RecordReader;
 import org.apache.hadoop.mapreduce.TaskAttemptContext;
 import org.apache.hadoop.mapreduce.TaskAttemptID;
 import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
-import org.apache.hadoop.mapreduce.lib.input.LineRecordReader;
+import org.apache.hadoop.mapreduce.lib.input.FileSplit;
+import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl;
 import org.apache.hadoop.util.IndexedSortable;
 import org.apache.hadoop.util.QuickSort;
+import org.apache.hadoop.util.StringUtils;
 
 public class DataInputFormat extends FileInputFormat<Text, Text> {
 
     public static final String PARTITION_FILENAME = "_partition.lst";
-    public static final String SAMPLE_SIZE = "datasort.partitions.sample";
-    private JobContext lastJob = null;
-    private List<InputSplit> lastResult = null;
+    public static final int KEY_LENGTH = 10;
+    public static final int VALUE_LENGTH = 90;
+    static final int RECORD_LENGTH = KEY_LENGTH + VALUE_LENGTH;
+    private static MRJobConfig lastContext = null;
+    private static List<InputSplit> lastResult = null;
 
     static class TextSampler implements IndexedSortable {
         private ArrayList<Text> records = new ArrayList<Text>();
@@ -44,7 +50,9 @@ public class DataInputFormat extends FileInputFormat<Text, Text> {
         }
 
         public void addKey(Text key) {
-            records.add(new Text(key));
+            synchronized (this) {
+                records.add(new Text(key));
+            }
         }
 
         /**
@@ -57,14 +65,13 @@ public class DataInputFormat extends FileInputFormat<Text, Text> {
          */
         Text[] createPartitions(int numPartitions) {
             int numRecords = records.size();
-            System.out.println("Making " + numPartitions + " from " + numRecords + " records");
+            System.out.println("Making " + numPartitions + " from " + numRecords + " sampled records");
             if (numPartitions > numRecords) {
                 throw new IllegalArgumentException(
                         "Requested more partitions than input keys (" + numPartitions + " > " + numRecords + ")");
             }
             new QuickSort().sort(this, 0, records.size());
             float stepSize = numRecords / (float) numPartitions;
-            System.out.println("Step size is " + stepSize);
             Text[] result = new Text[numPartitions - 1];
             for (int i = 1; i < numPartitions; ++i) {
                 result[i - 1] = records.get(Math.round(stepSize * i));
@@ -80,114 +87,191 @@ public class DataInputFormat extends FileInputFormat<Text, Text> {
      * 
      * @param job      the job to sample
      * @param partFile where to write the output file to
-     * @throws IOException          if something goes wrong
-     * @throws InterruptedException
+     * @throws Throwable if something goes wrong
      */
-    public static void writePartitionFile(JobContext job, Path partFile) throws IOException, InterruptedException {
-        DataInputFormat inFormat = new DataInputFormat();
-        TextSampler sampler = new TextSampler();
+    public static void writePartitionFile(final JobContext job, Path partFile) throws Throwable {
+        long t1 = System.currentTimeMillis();
         Configuration conf = job.getConfiguration();
+        final DataInputFormat inFormat = new DataInputFormat();
+        final TextSampler sampler = new TextSampler();
         int partitions = job.getNumReduceTasks();
-        long sampleSize = conf.getLong(SAMPLE_SIZE, 100000);
-        List<InputSplit> splits = inFormat.getSplits(job);
-        int samples = Math.min(10, splits.size());
-        long recordsPerSample = sampleSize / samples;
-        int sampleStep = splits.size() / samples;
-        long records = 0;
+        long sampleSize = conf.getLong(DataSortConfigKeys.SAMPLE_SIZE.key(), DataSortConfigKeys.DEFAULT_SAMPLE_SIZE);
+        final List<InputSplit> splits = inFormat.getSplits(job);
+        long t2 = System.currentTimeMillis();
+        System.out.println("Computing input splits took " + (t2 - t1) + "ms");
+        int samples = Math.min(
+                conf.getInt(DataSortConfigKeys.NUM_PARTITIONS.key(), DataSortConfigKeys.DEFAULT_NUM_PARTITIONS),
+                splits.size());
+        System.out.println("Sampling " + samples + " splits of " + splits.size());
+        final long recordsPerSample = sampleSize / samples;
+        final int sampleStep = splits.size() / samples;
+        Thread[] samplerReader = new Thread[samples];
+        SamplerThreadGroup threadGroup = new SamplerThreadGroup("Sampler Reader Thread Group");
         // take N samples from different parts of the input
         for (int i = 0; i < samples; ++i) {
-            RecordReader<Text, Text> reader = inFormat.createRecordReader(splits.get(sampleStep * i),
-                    new TaskAttemptContext(conf, new TaskAttemptID()));
-            while (reader.nextKeyValue()) {
-                sampler.addKey(reader.getCurrentKey());
-                records += 1;
-                if ((i + 1) * recordsPerSample <= records) {
-                    break;
+            final int idx = i;
+            samplerReader[i] = new Thread(threadGroup, "Sampler Reader " + idx) {
+                {
+                    setDaemon(true);
                 }
-            }
+
+                public void run() {
+                    long records = 0;
+                    try {
+                        TaskAttemptContext context = new TaskAttemptContextImpl(job.getConfiguration(),
+                                new TaskAttemptID());
+                        RecordReader<Text, Text> reader = inFormat.createRecordReader(splits.get(sampleStep * idx),
+                                context);
+                        reader.initialize(splits.get(sampleStep * idx), context);
+                        while (reader.nextKeyValue()) {
+                            sampler.addKey(new Text(reader.getCurrentKey()));
+                            records += 1;
+                            if (recordsPerSample <= records) {
+                                break;
+                            }
+                        }
+                    } catch (IOException ie) {
+                        System.err
+                                .println("Got an exception while reading splits " + StringUtils.stringifyException(ie));
+                        throw new RuntimeException(ie);
+                    } catch (InterruptedException e) {
+
+                    }
+                }
+            };
+            samplerReader[i].start();
         }
         FileSystem outFs = partFile.getFileSystem(conf);
-        if (outFs.exists(partFile)) {
-            outFs.delete(partFile, false);
+        DataOutputStream writer = outFs.create(partFile, true, 64 * 1024, (short) 10,
+                outFs.getDefaultBlockSize(partFile));
+        for (int i = 0; i < samples; i++) {
+            try {
+                samplerReader[i].join();
+                if (threadGroup.getThrowable() != null) {
+                    throw threadGroup.getThrowable();
+                }
+            } catch (InterruptedException e) {
+            }
         }
-        SequenceFile.Writer writer = SequenceFile.createWriter(outFs, conf, partFile, Text.class, NullWritable.class);
-        NullWritable nullValue = NullWritable.get();
         for (Text split : sampler.createPartitions(partitions)) {
-            writer.append(split, nullValue);
+            split.write(writer);
         }
         writer.close();
+        long t3 = System.currentTimeMillis();
+        System.out.println("Computing parititions took " + (t3 - t2) + "ms");
     }
 
-    /**
-     * Generate the list of files and make them into FileSplits.
-     */
-    @Override
-    public List<InputSplit> getSplits(JobContext job) throws IOException {
-        if (job == lastJob) {
-            return lastResult;
+    static class SamplerThreadGroup extends ThreadGroup {
+
+        private Throwable throwable;
+
+        public SamplerThreadGroup(String s) {
+            super(s);
         }
-        lastJob = job;
-        lastResult = super.getSplits(job);
-        return lastResult;
-    }
 
-    @Override
-    public RecordReader<Text, Text> createRecordReader(InputSplit split, TaskAttemptContext context)
-            throws IOException, InterruptedException {
-        RecordReader<Text, Text> rr = new DataRecordReader();
-        rr.initialize(split, context);
-        return rr;
+        @Override
+        public void uncaughtException(Thread thread, Throwable throwable) {
+            this.throwable = throwable;
+        }
+
+        public Throwable getThrowable() {
+            return this.throwable;
+        }
+
     }
 
     static class DataRecordReader extends RecordReader<Text, Text> {
-        private LineRecordReader in;
-        private static int KEY_LENGTH = 10;
-        private Text currentKey = new Text();
-        private Text currentValue = new Text();
+        private FSDataInputStream in;
+        private long offset;
+        private long length;
+        private static final int RECORD_LENGTH = KEY_LENGTH + VALUE_LENGTH;
+        private byte[] buffer = new byte[RECORD_LENGTH];
+        private Text key;
+        private Text value;
 
-        @Override
-        public Text getCurrentKey() throws IOException, InterruptedException {
-            return currentKey;
+        public DataRecordReader() throws IOException {
         }
 
-        @Override
-        public Text getCurrentValue() throws IOException, InterruptedException {
-            return currentValue;
-        }
-
-        @Override
         public void initialize(InputSplit split, TaskAttemptContext context) throws IOException, InterruptedException {
-            in = new LineRecordReader();
-            in.initialize(split, context);
+            Path p = ((FileSplit) split).getPath();
+            FileSystem fs = p.getFileSystem(context.getConfiguration());
+            in = fs.open(p);
+            long start = ((FileSplit) split).getStart();
+            // find the offset to start at a record boundary
+            offset = (RECORD_LENGTH - (start % RECORD_LENGTH)) % RECORD_LENGTH;
+            in.seek(start + offset);
+            length = ((FileSplit) split).getLength();
         }
 
-        @Override
-        public boolean nextKeyValue() throws IOException, InterruptedException {
-            if (in.nextKeyValue()) {
-                Text line = in.getCurrentValue();
-                if (line.getLength() < KEY_LENGTH) {
-                    currentKey.set(line);
-                    currentValue.clear();
-                } else {
-                    byte[] bytes = line.getBytes();
-                    currentKey.set(bytes, 0, KEY_LENGTH);
-                    currentValue.set(bytes, KEY_LENGTH, line.getLength() - KEY_LENGTH);
-                }
-                return true;
-            } else {
-                return false;
-            }
-        }
-
-        @Override
         public void close() throws IOException {
             in.close();
         }
 
-        @Override
-        public float getProgress() throws IOException, InterruptedException {
-            return in.getProgress();
+        public Text getCurrentKey() {
+            return key;
+        }
+
+        public Text getCurrentValue() {
+            return value;
+        }
+
+        public float getProgress() throws IOException {
+            return (float) offset / length;
+        }
+
+        public boolean nextKeyValue() throws IOException {
+            if (offset >= length) {
+                return false;
+            }
+            int read = 0;
+            while (read < RECORD_LENGTH) {
+                long newRead = in.read(buffer, read, RECORD_LENGTH - read);
+                if (newRead == -1) {
+                    if (read == 0) {
+                        return false;
+                    } else {
+                        throw new EOFException("read past eof");
+                    }
+                }
+                read += newRead;
+            }
+            if (key == null) {
+                key = new Text();
+            }
+            if (value == null) {
+                value = new Text();
+            }
+            key.set(buffer, 0, KEY_LENGTH);
+            value.set(buffer, KEY_LENGTH, VALUE_LENGTH);
+            offset += RECORD_LENGTH;
+            return true;
         }
     }
 
+    @Override
+    public RecordReader<Text, Text> createRecordReader(InputSplit split, TaskAttemptContext context)
+            throws IOException {
+        return new DataRecordReader();
+    }
+
+    @Override
+    public List<InputSplit> getSplits(JobContext job) throws IOException {
+        if (job == lastContext) {
+            return lastResult;
+        }
+        long t1, t2, t3;
+        t1 = System.currentTimeMillis();
+        lastContext = job;
+        lastResult = super.getSplits(job);
+        t2 = System.currentTimeMillis();
+        System.out.println("Spent " + (t2 - t1) + "ms computing base-splits.");
+        if (job.getConfiguration().getBoolean(DataSortConfigKeys.USE_DATA_SCHEDULER.key(),
+                DataSortConfigKeys.DEFAULT_USE_DATA_SCHEDULER)) {
+            DataScheduler scheduler = new DataScheduler(lastResult.toArray(new FileSplit[0]), job.getConfiguration());
+            lastResult = scheduler.getNewFileSplits();
+            t3 = System.currentTimeMillis();
+            System.out.println("Spent " + (t3 - t2) + "ms computing DataScheduler splits.");
+        }
+        return lastResult;
+    }
 }

@@ -12,10 +12,7 @@ public class ProjectDriver {
             pgd.addClass("datagen", DataGen.class, "Generate data for the datasort");
             pgd.addClass("datasort", DataSort.class, "Run the datasort");
             pgd.addClass("datavalidate", DataValidate.class, "Checking results of datasort");
-            pgd.driver(argv);
-
-            // Success
-            exitCode = 0;
+            exitCode = pgd.run(argv);
         } catch (Throwable e) {
             e.printStackTrace();
         }
